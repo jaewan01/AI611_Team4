@@ -1,0 +1,11 @@
+{
+    "epoch": 3,
+    "imagination_strategy": "Proposed",
+    "metrics": {
+        "ndcg_cold": 0.008933592547001133,
+        "ndcg_hybrid": 0.11705690423827952,
+        "actor_loss": -0.020813694367041953,
+        "critic_loss": 0.031542686315683216
+    },
+    "timestamp": "2025-06-07T17:49:04.800076"
+}
