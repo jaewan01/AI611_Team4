@@ -211,13 +211,11 @@ class content_mapping(torch.nn.Module):
         return self.fc2(score)
 
 class USIM(torch.nn.Module):
-    """
-    不适用token表示终结状态，而是actor单独判断是否结束
-    """
+
     def __init__(self, warm_model, args):
         super(USIM, self).__init__()
         self.warm_model = warm_model.RLmodel()
-        self.n_user = len(self.warm_model.user_embedding.weight) # 包含终止动作token
+        self.n_user = len(self.warm_model.user_embedding.weight) 
         self.args = args
         self.cold_item_ids = None
         self.warm_item_ids = None
@@ -246,7 +244,7 @@ class USIM(torch.nn.Module):
         #self.one_hot_matirx = torch.eye(self.n_user).to(self.args.device)
         #self.one_hot_matirx = np.eye(self.n_user)
 
-        self.transition_rate = args.transition_rate  #CiteULike最好结果 transition_rate:0.07 max_time:7 ml-1m 0.05 15
+        self.transition_rate = args.transition_rate  #
 
         self.max_time = args.max_time
 
@@ -254,21 +252,30 @@ class USIM(torch.nn.Module):
 
         self.lmbda = 0.95
 
-        self.k = self.args.k#固定
+        self.k = self.args.k
 
         self.k2 = self.args.k
 
-        self.negative_k = args.k #固定
+        self.negative_k = args.k 
 
         self.weight = args.weight
 
-        self.reward_cost = args.reward_cost #固定初始0.05
+        self.reward_cost = args.reward_cost 
 
-        self.noise_rate = 0#没用
+        self.noise_rate = 0
 
         self.noise_rate2 = 0
 
         self.hard_update()
+
+        self.embedding_alignment_rewards = None
+        
+        self.recommendation_rewards = None
+        
+        self.final_rewards = None
+
+    def get_current_reward(self):
+        return self.embedding_alignment_rewards, self.recommendation_rewards, self.final_rewards
 
     def hard_update(self):
         self.target_critic.load_state_dict(self.critic.state_dict())
@@ -357,6 +364,8 @@ class USIM(torch.nn.Module):
         target_user = interaction['user']
         item_content = interaction['item_content']
 
+        embedding_alignment_rewards, recommendation_rewards, final_rewards = [], [], []
+
         with torch.no_grad():
             item_embedding = self.warm_model.get_item_embedding(item)
             #state = self.content_mapper(item_content).detach()
@@ -368,8 +377,7 @@ class USIM(torch.nn.Module):
             state = self.content_mapper(item_content).detach()
             state_time = torch.zeros(len(item), dtype=torch.float32).to(self.args.device) + self.max_time
             state = state + torch.randn_like(state).to(self.args.device) * self.noise_rate
-
-            for i in range(self.max_time): #每个item最多生成10个user
+            for i in range(self.max_time): 
                 with torch.no_grad():
                     action, mask = self.sample_from_negative_distance6(state, item_embedding, i, state_time, action_list)
                     if action_list is None:
@@ -377,8 +385,14 @@ class USIM(torch.nn.Module):
                     else:
                         action_list = torch.concat((action_list, action.unsqueeze(dim=1)), dim=1)
                     #dones = self.check_dones(action, dones).detach()
-                    reward = self.get_reward(target_user, item_embedding, state,
-                                             action, dones, epoch).detach()  # batch_size * embedding_dim
+                    reward , embedding_alignment_reward, recommendation_reward = self.get_reward(target_user, item_embedding, state,
+                                             action, dones, epoch)  # batch_size * embedding_dim
+                    reward , embedding_alignment_reward, recommendation_reward = reward.detach() , embedding_alignment_reward.detach(), recommendation_reward.detach()
+                    
+                    embedding_alignment_rewards.append(embedding_alignment_reward.cpu().float())
+                    recommendation_rewards.append(recommendation_reward.cpu().float())
+                    final_rewards.append(reward.cpu().float())
+            
                     next_state = self.state_transition(state, action, dones)
                     dones = self.check_dones(action, dones).detach()
 
@@ -397,20 +411,26 @@ class USIM(torch.nn.Module):
         termination_critic_loss.backward()
         self.critic_optimizer.step()
 
+        self.embedding_alignment_rewards = np.mean(embedding_alignment_rewards)
+        self.recommendation_rewards = np.mean(recommendation_rewards)
+        self.final_rewards= np.mean(final_rewards)
+
         # termination_action = (torch.zeros(len(dones),dtype=torch.float32) + self.n_user - 1).to(self.args.device)
         # probs = self.actor.action_probs(termination_state)
         # termination_actor_loss = 0.001*self.CEloss(probs, termination_action.long())
         # self.actor_optimizer.zero_grad()
         # termination_actor_loss.backward()
         # self.actor_optimizer.step()
-        #TODO 完善评价指标的计算
         result = 1
         #self.content_mapping_optimizer.zero_grad()
         #content_mapping_loss.backward()
         #self.content_mapping_optimizer.step()
         self.hard_update()
+        
 
         return result
+
+
 
 
     def get_reward(self, target_user, item_embedding, state, action, dones, epoch):
@@ -455,22 +475,9 @@ class USIM(torch.nn.Module):
                 f.write(f"epoch: {epoch}, count: {count}, embedding_alignment_reward: {embedding_alignment_reward.sum().item()}, recommendation_reward: {recommendation_reward.sum().item()}\n")
             reward1 = self.weight * embedding_alignment_reward + (1 - self.weight) * recommendation_reward
 
-            # reward1 = self.weight * (similarity1 - similarity2).squeeze() + (1 - self.weight) * differ_score.mean(dim = -1)
-
-
-            #mask = (similarity2 < self.sim_distance).float().squeeze() * 100
-            #reward2 = similarityb - similaritya
-
-            #reward1 = (action == self.n_user - 1).float() * (similarity2 < self.sim_distance).float() + reward1
             reward = (reward1 - self.reward_cost) * (1 - dones.float())   # + reward2 + punishment
-            #reward = reward
 
-            #scores_next = self.full_sort_predict(next_state)
-            #scores = self.full_sort_predict(state)
-            #reward2 = utils.hit_score(target_user, scores_next, 10, sum=False) - utils.hit_score(target_user, scores, 10, sum=False)
-            #reward3 = utils.ndcg_score(target_user, scores_next, 10, sum=False) - utils.ndcg_score(target_user, scores, 10, sum=False)
-
-        return reward
+        return reward , embedding_alignment_reward, recommendation_reward
 
     def infer(self, content):
         action_list = None
@@ -655,33 +662,6 @@ class USIM(torch.nn.Module):
         one_hot_pos = F.one_hot(positive_sample, num_classes = self.n_user).sum(dim=1) >= 1
         one_hot_neg = F.one_hot(negative_sample, num_classes = self.n_user).sum(dim=1) >= 1
         one_hot_user = F.one_hot(topk_user, num_classes = self.n_user).sum(dim=1) >= 1
-        #frq_mask = one_hot_user.sum(dim=0) <20
-        #one_hot_pos_mask = F.one_hot(positive_mask, num_classes = self.n_user).sum(dim=1) >= 1
-        #one_hot_nue = F.one_hot(neutrality_sample, num_classes = self.n_user).sum(dim=1) >= 1
-        # bais_mask = one_hot_user.int().sum(dim=0) <= 15
-        # one_hot_user = one_hot_user * bais_mask
-        # one_hot_pos = self.one_hot_matirx[positive_sample]
-        # one_hot_neg = self.one_hot_matirx[negative_sample]
-        # one_hot_user = self.one_hot_matirx[topk_user]
-        # one_hot_pos = self.one_hot_matirx[positive_sample].sum(dim=1)
-        # one_hot_neg = self.one_hot_matirx[negative_sample].sum(dim=1)
-        # one_hot_user = self.one_hot_matirx[topk_user].sum(dim=1)
-
-        # if action_list != None:
-        #     mask = torch.logical_or(one_hot_pos, one_hot_user)
-        #     #mask = one_hot_pos * one_hot_user
-        #     mask = torch.logical_or(mask, one_hot_neg)
-        # else:
-        #     one_hot_action = F.one_hot(action_list, num_classes = self.n_user).sum(dim=1)
-        #     action_mask = torch.abs(1 - one_hot_action)
-        #     mask = torch.logical_or(one_hot_pos, one_hot_user)
-        #     # mask = one_hot_pos * one_hot_user
-        #     mask = torch.logical_or(mask, one_hot_neg)
-        #     mask = action_mask * mask
-
-        # mask = torch.logical_or(one_hot_pos, one_hot_user)
-        # dropout_mask = (torch.rand(mask.shape) > 0.4).to(self.args.device)
-        # mask = mask * dropout_mask
 
         mask = one_hot_pos * one_hot_user
         #mask = torch.logical_or(one_hot_pos, one_hot_user)
@@ -742,11 +722,3 @@ class USIM(torch.nn.Module):
         avg_length = length / len(content)
 
         return embedding_list,action_list
-
-
-
-
-
-
-
-
